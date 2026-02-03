@@ -18,7 +18,7 @@ bundled-sqlcipher = ["encryption", "rusqlite/bundled-sqlcipher-vendored-openssl"
 tantivy = "0.13.3"
 # tantivy = "=0.12.0" # Element desktop tantivy version 
 tinysegmenter = "0.1.1"
-rusqlite = "0.31.0"
+#rusqlite = "0.31.0"
 fs_extra = "1.2.0"
 r2d2_sqlite = "0.24.0"
 r2d2 = "0.8.9"
@@ -47,6 +47,12 @@ serde = { version = "1", default-features = false, features = ["derive"] }
 # Tantivy patch that fixes this issue https://github.com/tantivy-search/tantivy/pull/975
 # serde = { version = "=1.0.118", default-features = false, features = ["derive"] }
 thiserror = "1.0.26"
+
+# include sql-cipher inside ruslite
+# https://github.com/rusqlite/rusqlite?tab=readme-ov-file#notes-on-building-rusqlite-and-libsqlite3-sys
+[dependencies.rusqlite]
+version = "0.31.0"
+features = ["bundled-sqlcipher"]
 
 [dev-dependencies]
 tempfile = "3.2.0"
