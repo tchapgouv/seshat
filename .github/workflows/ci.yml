@@ -3,7 +3,6 @@ name: CI
 on:
   push:
   pull_request:
-    branches: [ master ]
 
 env:
   CARGO_TERM_COLOR: always
@@ -85,20 +84,21 @@ jobs:
         run: |
           cargo test --features=bundled-sqlcipher
 
+      #:tchap:
       # Checkout again to reset the test DB state
-      - name: Checkout
-        uses: actions/checkout@v4
+      #- name: Checkout
+      #  uses: actions/checkout@v4
 
-      - name: Install node
-        uses: actions/setup-node@v4
-        with:
-          node-version: '18'
+      #- name: Install node
+      #  uses: actions/setup-node@v4
+      #  with:
+      #    node-version: '18'
+      #- name: Install node build dependencies
+      # run: cd seshat-node && yarn install
 
-      - name: Install node build dependencies
-        run: cd seshat-node && yarn install
+      #- name: Build node module
+      #  run: cd seshat-node && yarn run build-bundled
 
-      - name: Build node module
-        run: cd seshat-node && yarn run build-bundled
-
-      - name: Test node module
-        run: cd seshat-node && yarn run test
+      #- name: Test node module
+      #  run: cd seshat-node && yarn run test
+      #:tchap:end

@@ -190,9 +190,9 @@ fn save_and_search() {
 #[test]
 fn search_with_room() {
     let tmpdir = tempdir().unwrap();
-    
+
     let mut db: Database = Database::new(tmpdir.path()).unwrap();
-    
+
     let profile = Profile::new("Alice", "");
 
     // :TCHAP: we add another event in the same room in order to replicate the bug when using AND operator in the query parser
