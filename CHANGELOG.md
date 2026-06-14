@@ -5,12 +5,47 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+## 4.3.0 - 2026-05-18
+
+### Changed
+
+- Panics that occur when applications attempt to communicate with the writer
+thread (when adding, removing, and committing events) will now generate a
+clearer error message.
+[[#174](https://github.com/matrix-org/seshat/pull/174), [#176](https://github.com/matrix-org/seshat/pull/176)]
+
+## 4.2.0 - 2026-04-14
+
+- Include the lock file in the package of the node bindings.
+  [[#166](https://github.com/matrix-org/seshat/pull/166)]
+
+## 4.1.0 - 2026-04-13
+
+### Added
+
+- Add N-gram tokenizer mode for CJK (Japanese, Chinese, Korean) language support.
+  Users can now choose between language-based and N-gram tokenization when
+  initializing the search index.
+  [[#150](https://github.com/matrix-org/seshat/pull/150)]
+- Handle `m.replace` edit events to remove original messages from search index,
+  preventing edited messages from appearing in search results with stale content.
+  [[#151](https://github.com/matrix-org/seshat/pull/151)]
+
+### Changed
+
+- Panics that occur while enqueuing a task on the JavaScript queue in the Node
+  bindings will now generate a clearer error message.
+  [[#162](https://github.com/matrix-org/seshat/pull/162)]
+
 ## 4.0.1 - 2025-02-18
 
 - Update the used OpenSSL version for improved ARM64 compatibility.
   [[#144](https://github.com/matrix-org/seshat/pull/144)]
 
 ## 4.0.0 - 2024-06-07
+
 - [[#136]] Upgrade mechanism for SQLCipher, this allows our users to upgrade
   SQLCipher since SQLCipher has some breaking changes with regards to the cipher
   settings. Otherwise a database that was created with a previous major
@@ -100,7 +135,7 @@ Node JS bindigns has changed which requires a major version bump.
 ### Added
 
 - [[#69]] Add support to get the user version from the recovery database and add
-      a shutdown method to the recovery database.
+  a shutdown method to the recovery database.
 
 [#69]: https://github.com/matrix-org/seshat/pull/69
 
@@ -113,12 +148,12 @@ Node JS bindigns has changed which requires a major version bump.
 - [[#64]] Exposed a method to change the passphrase in the js bindings.
 - [[#63]] Added support to paginate search results.
 - [[#60]] Added serde serialize/deserialize implementations for most of our
-      structs.
+  structs.
 
 ### Changed
 
 - [[#66]] Changed the return type of the search methods, they now return a
-      struct instead of a tuple. **This is a breaking change**.
+  struct instead of a tuple. **This is a breaking change**.
 - [[#62]] Made all encryption specific dependencies optional.
 - [[#59]] Switched from failure to thiserror for our error types.
 
