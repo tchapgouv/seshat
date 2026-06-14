@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{cmp::Ordering, collections::HashMap};
+use std::{cmp::Ordering, collections::HashMap, collections::HashSet};
 
-use rusqlite::{params, params_from_iter, ToSql};
+use rusqlite::{params, params_from_iter, OptionalExtension, ToSql};
 
 #[cfg(test)]
 use r2d2::PooledConnection;
@@ -25,7 +25,10 @@ use crate::{
     config::LoadDirection,
     database::{SearchResult, DATABASE_VERSION},
     error::Result,
-    events::{CrawlerCheckpoint, Event, EventContext, EventId, Profile, SerializedEvent},
+    events::{
+        get_replaced_event_id, CrawlerCheckpoint, Event, EventContext, EventId, Profile,
+        SerializedEvent,
+    },
     index::Writer as IndexWriter,
     Database,
 };
@@ -41,11 +44,29 @@ impl Database {
         connection: &rusqlite::Connection,
         index_writer: &mut IndexWriter,
         events: &mut Vec<(Event, Profile)>,
+        replaced_event_ids: &mut HashSet<EventId>,
     ) -> Result<(bool, Vec<i64>)> {
         let mut ret = Vec::new();
         let mut event_ids = Vec::new();
 
         for (mut e, mut p) in events.drain(..) {
+            // (1) If this is an edit event, delete the original and mark it as replaced
+            // Use fast string match first to avoid JSON parsing for most events
+            if e.source.contains("m.replace") {
+                if let Some(target_id) = get_replaced_event_id(&e.source) {
+                    Database::delete_event_by_id(connection, &target_id)?;
+                    index_writer.delete_event(&target_id);
+                    replaced_event_ids.insert(target_id);
+                }
+            }
+
+            // (2) If this event has been replaced by an edit, skip it
+            if replaced_event_ids.contains(&e.event_id) {
+                ret.push(true);
+                continue;
+            }
+
+            // (3) Normal save logic
             let event_id = Database::save_event(connection, &mut e, &mut p)?;
             match event_id {
                 Some(id) => {
@@ -155,11 +176,13 @@ impl Database {
         ),
         force_commit: bool,
         uncommitted_events: &mut Vec<i64>,
+        replaced_event_ids: &mut HashSet<EventId>,
     ) -> Result<(bool, bool)> {
         let (new_checkpoint, old_checkpoint, events) = message;
         let transaction = connection.transaction()?;
 
-        let (ret, event_ids) = Database::write_events_helper(&transaction, index_writer, events)?;
+        let (ret, event_ids) =
+            Database::write_events_helper(&transaction, index_writer, events, replaced_event_ids)?;
         Database::replace_crawler_checkpoint(
             &transaction,
             new_checkpoint.as_ref(),
@@ -597,7 +620,42 @@ impl Database {
         connection: &rusqlite::Connection,
         event_id: &str,
     ) -> rusqlite::Result<usize> {
-        connection.execute("DELETE from events WHERE event_id == ?1", [event_id])
+        // Make the multi-statement delete atomic even if we're called outside an existing
+        // transaction. SAVEPOINT also works when we *are* already inside an outer transaction.
+        connection.execute_batch("SAVEPOINT seshat_delete_event_by_id;")?;
+
+        let res: rusqlite::Result<usize> = (|| {
+            // First, get the internal event id to delete from uncommitted_events
+            let internal_id: Option<i64> = connection
+                .query_row(
+                    "SELECT id FROM events WHERE event_id = ?1",
+                    [event_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+
+            if let Some(id) = internal_id {
+                // Delete from uncommitted_events first (due to FOREIGN KEY constraint)
+                connection.execute("DELETE FROM uncommitted_events WHERE event_id = ?1", [id])?;
+            }
+
+            // Then delete the event
+            connection.execute("DELETE FROM events WHERE event_id = ?1", [event_id])
+        })();
+
+        match res {
+            Ok(n) => {
+                connection.execute_batch("RELEASE seshat_delete_event_by_id;")?;
+                Ok(n)
+            }
+            Err(e) => {
+                // Best-effort rollback to avoid leaving the connection inside a savepoint.
+                let _ = connection.execute_batch(
+                    "ROLLBACK TO seshat_delete_event_by_id; RELEASE seshat_delete_event_by_id;",
+                );
+                Err(e)
+            }
+        }
     }
 
     pub(crate) fn event_in_store(
@@ -735,7 +793,7 @@ impl Database {
         }
     }
 
-    /// Load events surounding the given event.
+    /// Load events surrounding the given event.
     pub(crate) fn load_event_context(
         connection: &rusqlite::Connection,
         event: &Event,
