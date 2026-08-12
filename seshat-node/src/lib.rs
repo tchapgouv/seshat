@@ -85,10 +85,8 @@ impl SeshatRecovery {
             Ok(c) => match c {
                 Ok(c) => c,
                 Err(e) => {
-                    return cx.throw_type_error(format!(
-                        "Unable to get a database connection {}",
-                        e.to_string()
-                    ))
+                    return cx
+                        .throw_type_error(format!("Unable to get a database connection {}", e))
                 }
             },
             Err(e) => return cx.throw_type_error(e),
@@ -191,10 +189,8 @@ impl Seshat {
             Ok(c) => match c {
                 Ok(c) => c,
                 Err(e) => {
-                    return cx.throw_type_error(format!(
-                        "Unable to get a database connection {}",
-                        e.to_string()
-                    ))
+                    return cx
+                        .throw_type_error(format!("Unable to get a database connection {}", e))
                 }
             },
             Err(e) => return cx.throw_type_error(e),
@@ -267,8 +263,8 @@ impl Seshat {
         };
 
         let receiver = {
-            let db = &mut this.borrow_mut().database;
-            db.as_mut().map_or_else(
+            let db = &this.borrow().database;
+            db.as_ref().map_or_else(
                 || Err(CLOSED_ERROR),
                 |db| {
                     if force {
@@ -324,10 +320,8 @@ impl Seshat {
             Ok(c) => match c {
                 Ok(c) => c,
                 Err(e) => {
-                    return cx.throw_type_error(format!(
-                        "Unable to get a database connection {}",
-                        e.to_string()
-                    ))
+                    return cx
+                        .throw_type_error(format!("Unable to get a database connection {}", e))
                 }
             },
             Err(e) => return cx.throw_type_error(e),
@@ -369,10 +363,8 @@ impl Seshat {
             Ok(c) => match c {
                 Ok(c) => c,
                 Err(e) => {
-                    return cx.throw_type_error(format!(
-                        "Unable to get a database connection {}",
-                        e.to_string()
-                    ))
+                    return cx
+                        .throw_type_error(format!("Unable to get a database connection {}", e))
                 }
             },
             Err(e) => return cx.throw_type_error(e),
@@ -397,10 +389,8 @@ impl Seshat {
             Ok(c) => match c {
                 Ok(c) => c,
                 Err(e) => {
-                    return cx.throw_type_error(format!(
-                        "Unable to get a database connection {}",
-                        e.to_string()
-                    ))
+                    return cx
+                        .throw_type_error(format!("Unable to get a database connection {}", e))
                 }
             },
             Err(e) => return cx.throw_type_error(e),
@@ -427,10 +417,8 @@ impl Seshat {
             Ok(c) => match c {
                 Ok(c) => c,
                 Err(e) => {
-                    return cx.throw_type_error(format!(
-                        "Unable to get a database connection {}",
-                        e.to_string()
-                    ))
+                    return cx
+                        .throw_type_error(format!("Unable to get a database connection {}", e))
                 }
             },
             Err(e) => return cx.throw_type_error(e),
@@ -455,10 +443,8 @@ impl Seshat {
             Ok(c) => match c {
                 Ok(c) => c,
                 Err(e) => {
-                    return cx.throw_type_error(format!(
-                        "Unable to get a database connection {}",
-                        e.to_string()
-                    ))
+                    return cx
+                        .throw_type_error(format!("Unable to get a database connection {}", e))
                 }
             },
             Err(e) => return cx.throw_type_error(e),
@@ -491,10 +477,10 @@ impl Seshat {
         };
 
         let ret = {
-            let db = &mut this.borrow_mut().database;
+            let db = &this.borrow().database;
 
             if wait {
-                db.as_mut().map_or_else(
+                db.as_ref().map_or_else(
                     || Err(CLOSED_ERROR),
                     |db| {
                         if force {
@@ -505,7 +491,7 @@ impl Seshat {
                     },
                 )
             } else {
-                db.as_mut().map_or_else(
+                db.as_ref().map_or_else(
                     || Err(CLOSED_ERROR),
                     |db| {
                         db.commit_no_wait();
@@ -585,7 +571,7 @@ impl Seshat {
 
         let searcher = match searcher {
             Ok(s) => s,
-            Err(e) => return cx.throw_type_error(e.to_string()),
+            Err(e) => return cx.throw_type_error(e),
         };
 
         let task = SearchTask {
@@ -697,7 +683,7 @@ impl Seshat {
                 Ok(s) => s,
                 Err(e) => return cx.throw_type_error(e.to_string()),
             },
-            Err(e) => return cx.throw_type_error(e.to_string()),
+            Err(e) => return cx.throw_type_error(e),
         };
 
         let task = LoadFileEventsTask {

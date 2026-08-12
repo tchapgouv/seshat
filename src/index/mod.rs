@@ -34,7 +34,7 @@ use uuid::Uuid;
 #[cfg(feature = "encryption")]
 use crate::index::encrypted_dir::{EncryptedMmapDirectory, PBKDF_COUNT};
 use crate::{
-    config::{Config, Language, SearchConfig},
+    config::{Config, Language, SearchConfig, TokenizerMode},
     events::{Event, EventId, EventType},
 };
 
@@ -120,7 +120,10 @@ pub(crate) struct Writer {
     event_id_field: tv::schema::Field,
     sender_field: tv::schema::Field,
     date_field: tv::schema::Field,
-    added_events: usize,
+
+    /// Number of events added or deleted since the last commit
+    events_pending_commit: usize,
+
     commit_timestamp: std::time::Instant,
     room_id_field: tv::schema::Field,
 }
@@ -131,13 +134,13 @@ impl Writer {
     }
 
     fn commit_helper(&mut self, force: bool) -> Result<bool, tv::TantivyError> {
-        if self.added_events > 0
+        if self.events_pending_commit > 0
             && (force
-                || self.added_events >= COMMIT_RATE
+                || self.events_pending_commit >= COMMIT_RATE
                 || self.commit_timestamp.elapsed() >= COMMIT_TIME)
         {
             self.inner.commit()?;
-            self.added_events = 0;
+            self.events_pending_commit = 0;
             self.commit_timestamp = std::time::Instant::now();
             Ok(true)
         } else {
@@ -165,14 +168,14 @@ impl Writer {
         doc.add_u64(self.date_field, event.server_ts as u64);
 
         self.inner.add_document(doc);
-        self.added_events += 1;
+        self.events_pending_commit += 1;
     }
 
     /// Delete the event with the given event id from the index.
     pub fn delete_event(&mut self, event_id: &str) {
         let term = Term::from_field_text(self.event_id_field, event_id);
         self.inner.delete_term(term);
-        self.inner.commit().unwrap();
+        self.events_pending_commit += 1;
     }
 
     pub fn wait_merging_threads(self) -> Result<(), tv::TantivyError> {
@@ -288,7 +291,7 @@ impl IndexSearcher {
                 None => continue,
             };
 
-            // Skip results that were already returne in a previous search.
+            // Skip results that were already returned in a previous search.
             if previous_results.contains(&event_id) {
                 continue;
             }
@@ -392,7 +395,8 @@ impl IndexSearcher {
 
 impl Index {
     pub fn new<P: AsRef<Path>>(path: P, config: &Config) -> Result<Index, tv::TantivyError> {
-        let tokenizer_name = config.language.as_tokenizer_name();
+        // Determine tokenizer name based on tokenizer mode
+        let tokenizer_name = config.tokenizer_mode.as_tokenizer_name(&config.language);
 
         let text_field_options = Index::create_text_options(&tokenizer_name);
         let mut schemabuilder = tv::schema::Schema::builder();
@@ -415,14 +419,27 @@ impl Index {
         let index = Index::open_index(path, config, schema)?;
         let reader = index.reader()?;
 
-        match config.language {
-            Language::Unknown => (),
-            _ => {
-                let tokenizer = tv::tokenizer::TextAnalyzer::from(tv::tokenizer::SimpleTokenizer)
-                    .filter(tv::tokenizer::RemoveLongFilter::limit(40))
-                    .filter(tv::tokenizer::LowerCaser)
-                    .filter(tv::tokenizer::Stemmer::new(config.language.as_tantivy()));
-                index.tokenizers().register(&tokenizer_name, tokenizer);
+        // Register tokenizer based on mode
+        match &config.tokenizer_mode {
+            TokenizerMode::Ngram { min_gram, max_gram } => {
+                let ngram_tokenizer =
+                    tv::tokenizer::NgramTokenizer::new(*min_gram, *max_gram, false);
+                index
+                    .tokenizers()
+                    .register(&tokenizer_name, ngram_tokenizer);
+            }
+            TokenizerMode::LanguageBased => {
+                match config.language {
+                    Language::Unknown => (), // Use default tokenizer
+                    _ => {
+                        let tokenizer =
+                            tv::tokenizer::TextAnalyzer::from(tv::tokenizer::SimpleTokenizer)
+                                .filter(tv::tokenizer::RemoveLongFilter::limit(40))
+                                .filter(tv::tokenizer::LowerCaser)
+                                .filter(tv::tokenizer::Stemmer::new(config.language.as_tantivy()));
+                        index.tokenizers().register(&tokenizer_name, tokenizer);
+                    }
+                }
             }
         }
 
@@ -526,7 +543,7 @@ impl Index {
             room_id_field: self.room_id_field,
             sender_field: self.sender_field,
             date_field: self.date_field,
-            added_events: 0,
+            events_pending_commit: 0,
             commit_timestamp: std::time::Instant::now(),
         })
     }
@@ -629,12 +646,12 @@ fn event_count() {
 
     let mut writer = index.get_writer().unwrap();
 
-    assert_eq!(writer.added_events, 0);
+    assert_eq!(writer.events_pending_commit, 0);
     writer.add_event(&EVENT);
-    assert_eq!(writer.added_events, 1);
+    assert_eq!(writer.events_pending_commit, 1);
 
     writer.force_commit().unwrap();
-    assert_eq!(writer.added_events, 0);
+    assert_eq!(writer.events_pending_commit, 0);
 }
 
 #[test]
@@ -706,4 +723,146 @@ fn paginated_search() {
     assert_eq!(&first_search.results[0].1, &EVENT.event_id);
     assert_eq!(&second_search.results[0].1, &TOPIC_EVENT.event_id);
     assert!(second_search.next_batch.is_none());
+}
+
+#[test]
+fn ngram_tokenizer_mode() {
+    let tmpdir = TempDir::new().unwrap();
+    let config = Config::new().use_ngram_tokenizer(2, 4);
+    let index = Index::new(&tmpdir, &config).unwrap();
+
+    let mut writer = index.get_writer().unwrap();
+    writer.add_event(&EVENT);
+    writer.force_commit().unwrap();
+    index.reload().unwrap();
+
+    let searcher = index.get_searcher();
+
+    // Search with partial text (ngram should match)
+    let result = searcher.search("est", &Default::default()).unwrap().results;
+
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].1, EVENT.event_id);
+}
+
+#[test]
+fn schema_mismatch_on_tokenizer_mode_change() {
+    let tmpdir = TempDir::new().unwrap();
+
+    // Create index with language-based tokenizer
+    {
+        let config = Config::new().set_language(&Language::English);
+        let index = Index::new(&tmpdir, &config).unwrap();
+        let mut writer = index.get_writer().unwrap();
+        writer.add_event(&EVENT);
+        writer.force_commit().unwrap();
+    }
+
+    // Try to open with ngram tokenizer - should fail with schema mismatch
+    {
+        let config = Config::new().use_ngram_tokenizer(2, 4);
+        let result = Index::new(&tmpdir, &config);
+        assert!(result.is_err());
+    }
+}
+
+#[test]
+fn schema_mismatch_on_ngram_size_change() {
+    let tmpdir = TempDir::new().unwrap();
+
+    // Create index with ngram tokenizer (2, 4)
+    {
+        let config = Config::new().use_ngram_tokenizer(2, 4);
+        let index = Index::new(&tmpdir, &config).unwrap();
+        let mut writer = index.get_writer().unwrap();
+        writer.add_event(&EVENT);
+        writer.force_commit().unwrap();
+    }
+
+    // Try to open with different ngram size - should fail with schema mismatch
+    {
+        let config = Config::new().use_ngram_tokenizer(3, 5);
+        let result = Index::new(&tmpdir, &config);
+        assert!(
+            result.is_err(),
+            "Different ngram sizes should cause schema mismatch"
+        );
+    }
+
+    // Reopen with same ngram size - should succeed
+    {
+        let config = Config::new().use_ngram_tokenizer(2, 4);
+        let result = Index::new(&tmpdir, &config);
+        assert!(result.is_ok(), "Same ngram sizes should work");
+    }
+}
+
+#[test]
+fn ngram_tokenizer_japanese() {
+    let tmpdir = TempDir::new().unwrap();
+    let config = Config::new().use_ngram_tokenizer(2, 4);
+    let index = Index::new(&tmpdir, &config).unwrap();
+
+    // Create a Japanese event
+    let japanese_event = Event::new(
+        EventType::Message,
+        "トフォリゲートのことでした",
+        Some("m.text"),
+        "$japanese_event:example.org",
+        "@user:example.org",
+        1234567890,
+        "!test:example.org",
+        "{}",
+    );
+
+    let mut writer = index.get_writer().unwrap();
+    writer.add_event(&japanese_event);
+    writer.force_commit().unwrap();
+    index.reload().unwrap();
+
+    let searcher = index.get_searcher();
+
+    // Test 1: Full word search
+    println!("Test 1: Searching for 'トフォリゲート'");
+    let result = searcher
+        .search("トフォリゲート", &Default::default())
+        .unwrap()
+        .results;
+    println!("Result count: {}", result.len());
+    assert_eq!(result.len(), 1, "Full word search should match");
+
+    // Test 2: Partial search with 4-gram (should match)
+    println!("Test 2: Searching for 'トフォリ'");
+    let result = searcher
+        .search("トフォリ", &Default::default())
+        .unwrap()
+        .results;
+    println!("Result count: {}", result.len());
+    assert_eq!(
+        result.len(),
+        1,
+        "4-gram partial search 'トフォリ' should match"
+    );
+
+    // Test 3: Partial search with 2-gram (should match)
+    println!("Test 3: Searching for 'リゲ'");
+    let result = searcher
+        .search("リゲ", &Default::default())
+        .unwrap()
+        .results;
+    println!("Result count: {}", result.len());
+    assert_eq!(result.len(), 1, "2-gram partial search 'リゲ' should match");
+
+    // Test 4: Partial search with 3-gram (should match)
+    println!("Test 4: Searching for 'ゲート'");
+    let result = searcher
+        .search("ゲート", &Default::default())
+        .unwrap()
+        .results;
+    println!("Result count: {}", result.len());
+    assert_eq!(
+        result.len(),
+        1,
+        "3-gram partial search 'ゲート' should match"
+    );
 }

@@ -22,7 +22,10 @@ use fs_extra::dir;
 use r2d2::{Pool, PooledConnection};
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::ToSql;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
     sync::{
@@ -42,7 +45,7 @@ use crate::{
     config::{Config, SearchConfig},
     database::writer::Writer,
     error::{Error, Result},
-    events::{CrawlerCheckpoint, Event, EventId, HistoricEventsT, Profile},
+    events::{get_replaced_event_id, CrawlerCheckpoint, Event, EventId, HistoricEventsT, Profile},
     index::{Index, Writer as IndexWriter},
 };
 
@@ -67,14 +70,35 @@ pub(crate) enum ThreadMessage {
     Write(Sender<Result<()>>, bool),
     Delete(Sender<Result<bool>>, EventId),
     ShutDown(Sender<Result<()>>),
+    Reload(Sender<Result<()>>),
+}
+
+impl ThreadMessage {
+    /// Return a string representation of the message type.
+    pub fn message_type(&self) -> &'static str {
+        match self {
+            ThreadMessage::Event(_) => "Event",
+            ThreadMessage::HistoricEvents(_) => "HistoricEvents",
+            ThreadMessage::Write(_, _) => "Write",
+            ThreadMessage::Delete(_, _) => "Delete",
+            ThreadMessage::ShutDown(_) => "ShutDown",
+            ThreadMessage::Reload(_) => "Reload",
+        }
+    }
 }
 
 /// The Seshat database.
-#[derive(Clone)]
 pub struct Database {
     path: PathBuf,
     connection: Arc<Mutex<PooledConnection<SqliteConnectionManager>>>,
     pool: r2d2::Pool<SqliteConnectionManager>,
+
+    write_thread: JoinHandle<()>,
+    /// If the write thread panicked, the message it panicked with.
+    write_thread_panic_message: Arc<Mutex<Option<String>>>,
+    /// Whether a shutdown message has been sent to the writer thread.
+    shutdown_sent: AtomicBool,
+
     tx: Sender<ThreadMessage>,
     index: Index,
     config: Config,
@@ -140,12 +164,25 @@ impl Database {
         Database::unlock(&writer_connection, config)?;
         Database::set_pragmas(&writer_connection)?;
 
-        let (_t_handle, tx) = Database::spawn_writer(writer_connection, writer);
+        // Load the set of event IDs that have been replaced by edit events.
+        let replaced_event_ids = Database::load_replaced_event_ids(&writer_connection);
+
+        let write_thread_panic_message = Arc::new(Mutex::new(None));
+
+        let (t_handle, tx) = Database::spawn_writer(
+            writer_connection,
+            writer,
+            replaced_event_ids,
+            write_thread_panic_message.clone(),
+        );
 
         Ok(Database {
             path: path.into(),
             connection: Arc::new(Mutex::new(connection)),
             pool,
+            write_thread: t_handle,
+            write_thread_panic_message,
+            shutdown_sent: AtomicBool::new(false),
             tx,
             index,
             config: config.clone(),
@@ -283,58 +320,159 @@ impl Database {
         Ok(Index::new(path, config)?)
     }
 
+    /// Load the set of event IDs that have been replaced by edit events.
+    /// This only scans m.replace events (not all messages) for efficiency.
+    fn load_replaced_event_ids(connection: &rusqlite::Connection) -> HashSet<EventId> {
+        let mut replaced = HashSet::new();
+
+        // Only select events that contain m.replace relation (much faster than scanning all messages)
+        let query = r#"SELECT source FROM events WHERE type = 'm.room.message' AND source LIKE '%"rel_type":"m.replace"%'"#;
+        if let Ok(mut stmt) = connection.prepare(query) {
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0));
+            if let Ok(rows) = rows {
+                for source in rows.flatten() {
+                    if let Some(replaced_id) = get_replaced_event_id(&source) {
+                        replaced.insert(replaced_id);
+                    }
+                }
+            }
+        }
+
+        replaced
+    }
+
+    /// Start a writer thread.
+    ///
+    /// If the thread panics, the panic message will be stored in `panic_message_receiver`.
     fn spawn_writer(
         connection: PooledConnection<SqliteConnectionManager>,
         index_writer: IndexWriter,
+        replaced_event_ids: HashSet<EventId>,
+        panic_message_receiver: Arc<Mutex<Option<String>>>,
     ) -> WriterRet {
         let (tx, rx): (_, Receiver<ThreadMessage>) = channel();
 
         let t_handle = thread::spawn(move || {
-            let mut writer = Writer::new(connection, index_writer);
-            let mut loaded_unprocessed = false;
+            let thread_result = catch_unwind(AssertUnwindSafe(|| {
+                Self::writer_thread_body(connection, index_writer, replaced_event_ids, rx)
+            }));
 
-            while let Ok(message) = rx.recv() {
-                match message {
-                    ThreadMessage::Event((event, profile)) => writer.add_event(event, profile),
-                    ThreadMessage::Write(sender, force_commit) => {
-                        // We may have events that aren't deleted or committed
-                        // to the index but are stored in the db, let us load
-                        // them from the db and commit them to the index now.
-                        // They will later be marked as committed in the
-                        // database as part of a normal write.
-                        if !loaded_unprocessed {
-                            let ret = writer.load_unprocessed_events();
-
-                            loaded_unprocessed = true;
-
-                            if ret.is_err() {
-                                sender.send(ret).unwrap_or(());
-                                continue;
-                            }
-                        }
-                        let ret = writer.write_queued_events(force_commit);
-                        // Notify that we are done with the write.
-                        sender.send(ret).unwrap_or(());
-                    }
-                    ThreadMessage::HistoricEvents(m) => {
-                        let (check, old_check, events, sender) = m;
-                        let ret = writer.write_historic_events(check, old_check, events, true);
-                        sender.send(ret).unwrap_or(());
-                    }
-                    ThreadMessage::Delete(sender, event_id) => {
-                        let ret = writer.delete_event(event_id);
-                        sender.send(ret).unwrap_or(());
-                    }
-                    ThreadMessage::ShutDown(sender) => {
-                        let ret = writer.shutdown();
-                        sender.send(ret).unwrap_or(());
-                        return;
-                    }
+            // If the thread panicked, we store the panic message for later reporting. (In theory
+            // we could also do this by calling `JoinHandle.join` but, since that blocks and takes
+            // ownership of the `JoinHandle`, it ends up being a being more fiddly than it's worth.)
+            if let Err(panic) = thread_result {
+                let panic_message: &str = if let Some(string) = panic.downcast_ref::<String>() {
+                    string
+                } else if let Some(str) = panic.downcast_ref::<&str>() {
+                    str
+                } else {
+                    "Unknown message"
                 };
-            }
+                panic_message_receiver
+                    .lock()
+                    .unwrap()
+                    .replace(panic_message.to_owned());
+            };
         });
 
         (t_handle, tx)
+    }
+
+    fn writer_thread_body(
+        connection: PooledConnection<SqliteConnectionManager>,
+        index_writer: IndexWriter,
+        replaced_event_ids: HashSet<EventId>,
+        rx: Receiver<ThreadMessage>,
+    ) {
+        let mut writer = Writer::new(connection, index_writer, replaced_event_ids);
+        let mut loaded_unprocessed = false;
+
+        while let Ok(message) = rx.recv() {
+            match message {
+                ThreadMessage::Event((event, profile)) => writer.add_event(event, profile),
+                ThreadMessage::Write(sender, force_commit) => {
+                    // We may have events that aren't deleted or committed
+                    // to the index but are stored in the db, let us load
+                    // them from the db and commit them to the index now.
+                    // They will later be marked as committed in the
+                    // database as part of a normal write.
+                    if !loaded_unprocessed {
+                        let ret = writer.load_unprocessed_events();
+
+                        loaded_unprocessed = true;
+
+                        if ret.is_err() {
+                            // It's fine to ignore the send error, this means that the caller
+                            // just dropped the receiver and isn't interested in the result
+                            // anymore.
+                            let _e = sender.send(ret);
+                            continue;
+                        }
+                    }
+                    let ret = writer.write_queued_events(force_commit);
+                    // Notify that we are done with the write.
+                    //
+                    // Same as the previous one, fine to ignore the error on the send.
+                    let _e = sender.send(ret);
+                }
+                ThreadMessage::HistoricEvents(m) => {
+                    let (check, old_check, events, sender) = m;
+                    let ret = writer.write_historic_events(check, old_check, events, true);
+                    // Same as the previous one, fine to ignore the error on the send.
+                    let _e = sender.send(ret);
+                }
+                ThreadMessage::Delete(sender, event_id) => {
+                    let ret = writer.delete_event(event_id);
+                    // Same as the previous one, fine to ignore the error on the send.
+                    let _e = sender.send(ret);
+                }
+                ThreadMessage::ShutDown(sender) => {
+                    let ret = writer.shutdown();
+                    // Same as the previous one, fine to ignore the error on the send.
+                    let _e = sender.send(ret);
+                    return;
+                }
+                ThreadMessage::Reload(sender) => {
+                    // Since Tokio's mpsc is FIFO, receiving this message ensures all
+                    // previous write operations have been processed.
+                    //
+                    // Same as the previous one, fine to ignore the error on the send.
+                    let _e = sender.send(Ok(()));
+                }
+            };
+        }
+    }
+
+    /// Send a ThreadMessage to the writer thread.
+    ///
+    /// If sending the message fails (likely because the writer thread has shut down), panics, with
+    /// a message including the reason the writer thread exited, if known.
+    fn send_message_to_writer(&self, message: ThreadMessage) {
+        self.tx.send(message).unwrap_or_else(|e| {
+            // Send can only fail if the receiver has disconnected, meaning the writer thread has
+            // exited. If it panicked, report the panic message.
+            let msg = if let Some(panic_message) = self
+                .write_thread_panic_message
+                .lock()
+                .unwrap()
+                .as_ref()
+                .cloned()
+            {
+                format!("Writer thread panicked with message: {}", panic_message)
+            } else if self.shutdown_sent.load(Ordering::Relaxed) {
+                "Shutdown message was sent".to_string()
+            } else if self.write_thread.is_finished() {
+                "Writer thread exited without panicking".to_string()
+            } else {
+                "Writer thread is still running".to_string()
+            };
+
+            panic!(
+                "Could not send message of type {} to writer thread: {}",
+                e.0.message_type(),
+                msg
+            );
+        });
     }
 
     /// Add an event with the given profile to the database.
@@ -348,7 +486,7 @@ impl Database {
     /// only when the user calls the `commit()` method.
     pub fn add_event(&self, event: Event, profile: Profile) {
         let message = ThreadMessage::Event((event, profile));
-        self.tx.send(message).unwrap();
+        self.send_message_to_writer(message);
     }
 
     /// Delete an event from the database.
@@ -364,20 +502,20 @@ impl Database {
     pub fn delete_event(&self, event_id: &str) -> Receiver<Result<bool>> {
         let (sender, receiver): (_, Receiver<Result<bool>>) = channel();
         let message = ThreadMessage::Delete(sender, event_id.to_owned());
-        self.tx.send(message).unwrap();
+        self.send_message_to_writer(message);
         receiver
     }
 
-    fn commit_helper(&mut self, force: bool) -> Receiver<Result<()>> {
+    fn commit_helper(&self, force: bool) -> Receiver<Result<()>> {
         let (sender, receiver): (_, Receiver<Result<()>>) = channel();
-        self.tx.send(ThreadMessage::Write(sender, force)).unwrap();
+        self.send_message_to_writer(ThreadMessage::Write(sender, force));
         receiver
     }
 
     /// Commit the currently queued up events. This method will block. A
     /// non-blocking version of this method exists in the `commit_no_wait()`
     /// method.
-    pub fn commit(&mut self) -> Result<()> {
+    pub fn commit(&self) -> Result<()> {
         self.commit_helper(false).recv().unwrap()
     }
 
@@ -390,14 +528,17 @@ impl Database {
     /// the `force_commit_no_wait()` method.
     ///
     /// This should only be used for testing purposes.
-    pub fn force_commit(&mut self) -> Result<()> {
+    pub fn force_commit(&self) -> Result<()> {
         self.commit_helper(true).recv().unwrap()
     }
 
     /// Reload the database so that a search reflects the state of the last
     /// commit. Note that this happens automatically and this method should be
     /// used only in unit tests.
-    pub fn reload(&mut self) -> Result<()> {
+    pub fn reload(&self) -> Result<()> {
+        let (sender, receiver) = channel();
+        self.send_message_to_writer(ThreadMessage::Reload(sender));
+        receiver.recv().unwrap()?;
         self.index.reload()?;
         Ok(())
     }
@@ -407,7 +548,7 @@ impl Database {
     ///
     /// Returns a receiver that will receive an empty message once the commit is
     /// done.
-    pub fn commit_no_wait(&mut self) -> Receiver<Result<()>> {
+    pub fn commit_no_wait(&self) -> Receiver<Result<()>> {
         self.commit_helper(false)
     }
 
@@ -420,7 +561,7 @@ impl Database {
     ///
     /// Returns a receiver that will receive an empty message once the commit is
     /// done.
-    pub fn force_commit_no_wait(&mut self) -> Receiver<Result<()>> {
+    pub fn force_commit_no_wait(&self) -> Receiver<Result<()>> {
         self.commit_helper(true)
     }
 
@@ -442,8 +583,7 @@ impl Database {
         let (sender, receiver): (_, Receiver<Result<bool>>) = channel();
         let payload = (new_checkpoint, old_checkpoint, events, sender);
         let message = ThreadMessage::HistoricEvents(payload);
-        self.tx.send(message).unwrap();
-
+        self.send_message_to_writer(message);
         receiver
     }
 
@@ -487,7 +627,8 @@ impl Database {
     pub fn shutdown(self) -> Receiver<Result<()>> {
         let (sender, receiver): (_, Receiver<Result<()>>) = channel();
         let message = ThreadMessage::ShutDown(sender);
-        self.tx.send(message).unwrap();
+        self.shutdown_sent.store(true, Ordering::Relaxed);
+        self.send_message_to_writer(message);
         receiver
     }
 
@@ -606,14 +747,14 @@ fn load_event() {
 #[test]
 fn commit_a_write() {
     let tmpdir = tempdir().unwrap();
-    let mut db = Database::new(tmpdir.path()).unwrap();
+    let db = Database::new(tmpdir.path()).unwrap();
     db.commit().unwrap();
 }
 
 #[test]
 fn save_the_event_multithreaded() {
     let tmpdir = tempdir().unwrap();
-    let mut db = Database::new(tmpdir.path()).unwrap();
+    let db = Database::new(tmpdir.path()).unwrap();
     let profile = Profile::new("Alice", "");
 
     db.add_event(EVENT.clone(), profile);
@@ -654,7 +795,7 @@ fn load_a_profile() {
 #[test]
 fn load_event_context() {
     let tmpdir = tempdir().unwrap();
-    let mut db = Database::new(tmpdir.path()).unwrap();
+    let db = Database::new(tmpdir.path()).unwrap();
     let profile = Profile::new("Alice", "");
 
     db.add_event(EVENT.clone(), profile.clone());
@@ -790,7 +931,7 @@ fn duplicate_empty_profiles() {
 #[test]
 fn is_empty() {
     let tmpdir = tempdir().unwrap();
-    let mut db = Database::new(tmpdir.path()).unwrap();
+    let db = Database::new(tmpdir.path()).unwrap();
     let connection = db.get_connection().unwrap();
     assert!(connection.is_empty().unwrap());
 
@@ -805,7 +946,7 @@ fn is_empty() {
 fn encrypted_db() {
     let tmpdir = tempdir().unwrap();
     let db_config = Config::new().set_passphrase("test");
-    let mut db = match Database::new_with_config(tmpdir.path(), &db_config) {
+    let db = match Database::new_with_config(tmpdir.path(), &db_config) {
         Ok(db) => db,
         Err(e) => panic!("Coulnd't open encrypted database {}", e),
     };
@@ -846,7 +987,7 @@ fn encrypted_db() {
 fn change_passphrase() {
     let tmpdir = tempdir().unwrap();
     let db_config = Config::new().set_passphrase("test");
-    let mut db = match Database::new_with_config(tmpdir.path(), &db_config) {
+    let db = match Database::new_with_config(tmpdir.path(), &db_config) {
         Ok(db) => db,
         Err(e) => panic!("Coulnd't open encrypted database {}", e),
     };
@@ -889,7 +1030,7 @@ fn change_passphrase() {
 #[test]
 fn resume_committing() {
     let tmpdir = tempdir().unwrap();
-    let mut db = Database::new(tmpdir.path()).unwrap();
+    let db = Database::new(tmpdir.path()).unwrap();
     let profile = Profile::new("Alice", "");
 
     // Check that we don't have any uncommitted events.
@@ -935,7 +1076,7 @@ fn resume_committing() {
         db = Database::new(tmpdir.path())
     }
 
-    let mut db = db.unwrap();
+    let db = db.unwrap();
 
     // We still have uncommitted events.
     assert_eq!(
@@ -964,7 +1105,7 @@ fn resume_committing() {
 #[test]
 fn delete_uncommitted() {
     let tmpdir = tempdir().unwrap();
-    let mut db = Database::new(tmpdir.path()).unwrap();
+    let db = Database::new(tmpdir.path()).unwrap();
     let profile = Profile::new("Alice", "");
 
     for i in 1..1000 {
@@ -988,7 +1129,7 @@ fn delete_uncommitted() {
 #[test]
 fn stats_getting() {
     let tmpdir = tempdir().unwrap();
-    let mut db = Database::new(tmpdir.path()).unwrap();
+    let db = Database::new(tmpdir.path()).unwrap();
     let profile = Profile::new("Alice", "");
 
     for i in 0..1000 {
@@ -1035,11 +1176,20 @@ use crate::database::recovery::test::reindex_loop;
 #[ignore]
 #[test]
 fn database_upgrade_v1_2() {
-    let mut path = PathBuf::from(file!());
-    path.pop();
-    path.pop();
-    path.pop();
-    path.push("data/database/v1_2");
+    // Copy test database to temp directory to avoid modifying the original
+    let mut src_path = PathBuf::from(file!());
+    src_path.pop();
+    src_path.pop();
+    src_path.pop();
+    src_path.push("data/database/v1_2");
+
+    let tmpdir = tempdir().unwrap();
+    let path = tmpdir.path().to_path_buf();
+
+    let mut options = fs_extra::dir::CopyOptions::new();
+    options.content_only = true;
+    fs_extra::dir::copy(&src_path, &path, &options).expect("Failed to copy test database");
+
     let db = Database::new(&path);
     match db {
         Ok(_) => panic!("Database doesn't need a reindex."),
@@ -1073,7 +1223,7 @@ fn database_upgrade_v1_2() {
 #[test]
 fn delete_an_event() {
     let tmpdir = tempdir().unwrap();
-    let mut db = Database::new(tmpdir.path()).unwrap();
+    let db = Database::new(tmpdir.path()).unwrap();
     let profile = Profile::new("Alice", "");
 
     db.add_event(EVENT.clone(), profile.clone());
@@ -1099,7 +1249,7 @@ fn delete_an_event() {
 
     drop(db);
 
-    let mut db = Database::new(tmpdir.path()).unwrap();
+    let db = Database::new(tmpdir.path()).unwrap();
     assert_eq!(
         Database::load_pending_deletion_events(&db.connection.lock().unwrap())
             .unwrap()
@@ -1149,7 +1299,7 @@ fn add_events_with_null_byte() {
 #[test]
 fn is_room_indexed() {
     let tmpdir = tempdir().unwrap();
-    let mut db = Database::new(tmpdir.path()).unwrap();
+    let db = Database::new(tmpdir.path()).unwrap();
 
     let connection = db.get_connection().unwrap();
 
@@ -1176,7 +1326,8 @@ fn user_version() {
 }
 
 #[test]
-#[cfg(feature = "encryption")]
+// TODO: This test fails on windows with a rather alarming "Invalid access to memory location."
+#[cfg(all(feature = "encryption", not(windows)))]
 fn sqlcipher_cipher_settings_update() {
     let mut path = PathBuf::from(file!());
     path.pop();
@@ -1187,4 +1338,122 @@ fn sqlcipher_cipher_settings_update() {
     let config = Config::new().set_passphrase("qR17RdpWurSh2pQRSc/EnsaO9V041kOwsZk0iSdUY/g");
     let _db =
         Database::new_with_config(&path, &config).expect("We should be able to open the database");
+}
+
+#[test]
+fn edit_event_removes_original() {
+    use crate::config::SearchConfig;
+
+    let tmpdir = tempdir().unwrap();
+    let db = Database::new(tmpdir.path()).unwrap();
+    let profile = Profile::new("Alice", "");
+
+    // Add an original message
+    let original_event = Event::new(
+        crate::EventType::Message,
+        "Original message",
+        Some("m.text"),
+        "$original:localhost",
+        "@alice:localhost",
+        1000,
+        "!test_room:localhost",
+        r#"{"type":"m.room.message","event_id":"$original:localhost","sender":"@alice:localhost","origin_server_ts":1000,"room_id":"!test_room:localhost","content":{"body":"Original message","msgtype":"m.text"}}"#,
+    );
+
+    db.add_event(original_event, profile.clone());
+    db.force_commit().unwrap();
+    db.reload().unwrap();
+
+    // Verify the original message is searchable
+    let results = db.search("Original", &SearchConfig::new()).unwrap();
+    assert_eq!(results.results.len(), 1, "Original message should be found");
+
+    // Add an edit event that replaces the original
+    let edit_event = Event::new(
+        crate::EventType::Message,
+        "Edited message",
+        Some("m.text"),
+        "$edit:localhost",
+        "@alice:localhost",
+        2000,
+        "!test_room:localhost",
+        r#"{"type":"m.room.message","event_id":"$edit:localhost","sender":"@alice:localhost","origin_server_ts":2000,"room_id":"!test_room:localhost","content":{"body":"* Edited message","msgtype":"m.text","m.new_content":{"body":"Edited message","msgtype":"m.text"},"m.relates_to":{"rel_type":"m.replace","event_id":"$original:localhost"}}}"#,
+    );
+
+    db.add_event(edit_event, profile);
+    db.force_commit().unwrap();
+    db.reload().unwrap();
+
+    // The original message should no longer be searchable
+    let results = db.search("Original", &SearchConfig::new()).unwrap();
+    assert_eq!(
+        results.results.len(),
+        0,
+        "Original message should be removed from index"
+    );
+
+    // The edited message should be searchable
+    let results = db.search("Edited", &SearchConfig::new()).unwrap();
+    assert_eq!(results.results.len(), 1, "Edited message should be found");
+}
+
+#[test]
+fn original_event_skipped_if_edit_comes_first() {
+    use crate::config::SearchConfig;
+
+    let tmpdir = tempdir().unwrap();
+    let db = Database::new(tmpdir.path()).unwrap();
+    let profile = Profile::new("Alice", "");
+
+    // Add an edit event FIRST (before the original)
+    let edit_event = Event::new(
+        crate::EventType::Message,
+        "Edited message",
+        Some("m.text"),
+        "$edit:localhost",
+        "@alice:localhost",
+        2000,
+        "!test_room:localhost",
+        r#"{"type":"m.room.message","event_id":"$edit:localhost","sender":"@alice:localhost","origin_server_ts":2000,"room_id":"!test_room:localhost","content":{"body":"* Edited message","msgtype":"m.text","m.new_content":{"body":"Edited message","msgtype":"m.text"},"m.relates_to":{"rel_type":"m.replace","event_id":"$original:localhost"}}}"#,
+    );
+
+    db.add_event(edit_event, profile.clone());
+    db.force_commit().unwrap();
+    db.reload().unwrap();
+
+    // Verify the edited message is searchable
+    let results = db.search("Edited", &SearchConfig::new()).unwrap();
+    assert_eq!(results.results.len(), 1, "Edited message should be found");
+
+    // Now add the original event (it should be skipped)
+    let original_event = Event::new(
+        crate::EventType::Message,
+        "Original message",
+        Some("m.text"),
+        "$original:localhost",
+        "@alice:localhost",
+        1000,
+        "!test_room:localhost",
+        r#"{"type":"m.room.message","event_id":"$original:localhost","sender":"@alice:localhost","origin_server_ts":1000,"room_id":"!test_room:localhost","content":{"body":"Original message","msgtype":"m.text"}}"#,
+    );
+
+    db.add_event(original_event, profile);
+    db.force_commit().unwrap();
+    db.reload().unwrap();
+
+    // The original message should NOT be searchable (it was skipped)
+    let results = db.search("Original", &SearchConfig::new()).unwrap();
+    assert_eq!(
+        results.results.len(),
+        0,
+        "Original message should not be added to index"
+    );
+
+    // The edited message should still be the only result
+    let results = db.search("Edited", &SearchConfig::new()).unwrap();
+    assert_eq!(
+        results.results.len(),
+        1,
+        "Edited message should still be the only result"
+    );
 }

@@ -25,14 +25,14 @@ use seshat::{Database, Event, Profile};
 use tempfile::tempdir;
 
 let tmpdir = tempdir().unwrap();
-let mut db = Database::new(tmpdir.path()).unwrap();
+let db = Database::new(tmpdir.path()).unwrap();
 
 /// Method to call for every live event that gets received during a sync.
 fn add_live_event(event: Event, profile: Profile, database: &Database) {
     database.add_event(event, profile);
 }
 /// Method to call on every successful sync after live events were added.
-fn on_sync(database: &mut Database) {
+fn on_sync(database: &Database) {
     database.commit().unwrap();
 }
 ```
@@ -42,12 +42,12 @@ The other mode is to add events from the room history using the
 storing checkpoints which remember the arguments to continue fetching events
 from the `/room/{room_id}/messages` API:
 
-```
+```rust
 database.add_historic_events(events, old_checkpoint, new_checkpoint)?;
 ```
 
 Once events have been added a search can be done:
-```
+```rust
 let result = database.search("test", &SearchConfig::new()).unwrap();
 ```
 
